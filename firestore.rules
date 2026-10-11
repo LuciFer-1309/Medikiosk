@@ -1,0 +1,221 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId} (Matches request.auth.uid)
+    // Fields:
+    //   - uid: string (required, immutable, must match request.auth.uid)
+    //   - email: string (required, immutable, valid email format)
+    //   - fullName: string (required, 1-100 characters)
+    //   - role: string (required, immutable by client, allowed values: 'patient', 'doctor')
+    //   - createdAt: string (required, immutable, ISO 8601 format)
+    //   - phone: string (optional, 0-30 characters)
+    //   - dateOfBirth: string (optional, 0-30 characters)
+    //   - licenseNumber: string (optional, 0-50 characters)
+    //   - specialty: string (optional, 0-100 characters)
+    //
+    // Collection: visits
+    // Document ID: {visitId} (Auto-generated Firestore ID)
+    // Fields:
+    //   - patientUid: string (required, immutable, must match request.auth.uid on create)
+    //   - patientName: string (required, 1-100 characters)
+    //   - chiefComplaint: string (required, 1-500 characters)
+    //   - duration: string (required, 1-50 characters)
+    //   - painLevel: number (required, integer between 1 and 10)
+    //   - allergies: string (required, 1-200 characters)
+    //   - consentGiven: bool (required, must be true)
+    //   - status: string (required, 'waiting' on create; transitions to 'in-consultation' or 'completed' only by doctors)
+    //   - createdAt: string (required, immutable)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated with Firebase Auth
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Check if the caller is the owner of the user document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() >= 5 &&
+        email.size() <= 254 &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate ISO 8601 string format
+    function isValidIsoDate(dateStr) {
+      return dateStr is string &&
+        dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    // Ensure only known schema fields exist in the user document
+    function hasOnlyAllowedUserFields(data) {
+      return data.keys().hasOnly([
+        'uid',
+        'email',
+        'fullName',
+        'role',
+        'createdAt',
+        'phone',
+        'dateOfBirth',
+        'licenseNumber',
+        'specialty'
+      ]);
+    }
+
+    // Validate all fields and constraints for a user document
+    function isValidUserProfile(data) {
+      return hasOnlyAllowedUserFields(data) &&
+        data.uid is string &&
+        data.uid == request.auth.uid &&
+        data.email is string &&
+        isValidEmail(data.email) &&
+        data.fullName is string &&
+        data.fullName.size() >= 1 &&
+        data.fullName.size() <= 100 &&
+        data.role in ['patient', 'doctor'] &&
+        isValidIsoDate(data.createdAt) &&
+        (!('phone' in data) || (data.phone is string && data.phone.size() <= 30)) &&
+        (!('dateOfBirth' in data) || (data.dateOfBirth is string && data.dateOfBirth.size() <= 30)) &&
+        (!('licenseNumber' in data) || (data.licenseNumber is string && data.licenseNumber.size() <= 50)) &&
+        (!('specialty' in data) || (data.specialty is string && data.specialty.size() <= 100));
+    }
+
+    // Check if user is an approved doctor
+    // Checks custom auth claims or an existing verified profile in /users
+    function isApprovedDoctor() {
+      return isAuthenticated() &&
+        (
+          request.auth.token.get('role', '') == 'doctor' ||
+          (
+            exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'doctor'
+          )
+        );
+    }
+
+    // Validate required visit fields and constraints on creation
+    function isValidVisit(data) {
+      return data.keys().hasAll([
+          'patientUid',
+          'patientName',
+          'chiefComplaint',
+          'duration',
+          'painLevel',
+          'allergies',
+          'consentGiven',
+          'status',
+          'createdAt'
+        ]) &&
+        data.patientUid is string &&
+        data.patientUid == request.auth.uid &&
+        data.patientName is string &&
+        data.patientName.size() >= 1 &&
+        data.patientName.size() <= 100 &&
+        data.chiefComplaint is string &&
+        data.chiefComplaint.size() >= 1 &&
+        data.chiefComplaint.size() <= 500 &&
+        data.duration is string &&
+        data.duration.size() >= 1 &&
+        data.duration.size() <= 50 &&
+        data.painLevel is number &&
+        data.painLevel >= 1 &&
+        data.painLevel <= 10 &&
+        data.allergies is string &&
+        data.allergies.size() >= 1 &&
+        data.allergies.size() <= 200 &&
+        data.consentGiven == true &&
+        data.status in ['waiting', 'in-consultation', 'completed'] &&
+        isValidIsoDate(data.createdAt);
+    }
+
+    // ===============================================================
+    // Collection: users
+    // ===============================================================
+    match /users/{userId} {
+      // 1. Read: Strict per-user privacy. Patients cannot read other patients or doctors' private profiles.
+      // Doctors can only read their own profile doc or other users for clinical triage if approved.
+      allow read: if isOwner(userId) || isApprovedDoctor();
+
+      // 2. Create:
+      // - Self-registration is strictly restricted to role == 'patient'.
+      // - Direct self-service creation of role == 'doctor' is DENIED.
+      //   Doctor profiles must be provisioned by admin/custom claims, or approved.
+      allow create: if isOwner(userId) &&
+        isValidUserProfile(request.resource.data) &&
+        (
+          request.resource.data.role == 'patient' ||
+          request.auth.token.get('admin', false) == true ||
+          request.auth.token.get('role', '') == 'doctor'
+        );
+
+      // 3. Update:
+      // - User can update their own permitted personal info (fullName, phone, dateOfBirth, etc.)
+      // - Core identity and role fields are IMMUTABLE: uid, email, role, createdAt CANNOT be altered.
+      allow update: if isOwner(userId) &&
+        isValidUserProfile(request.resource.data) &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.role == resource.data.role &&
+        request.resource.data.createdAt == resource.data.createdAt;
+
+      // 4. Delete: Denied from client
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // Collection: visits (Patient Digital Intake & Doctor Triage Queue)
+    // ===============================================================
+    match /visits/{visitId} {
+      // 1. Read:
+      // - Patient can only read their own visits.
+      // - Approved doctors can read all visits for the clinic triage queue.
+      allow read: if isAuthenticated() && (
+        resource.data.patientUid == request.auth.uid ||
+        isApprovedDoctor()
+      );
+
+      // 2. Create:
+      // - Only authenticated patients can create visits for themselves.
+      // - Patient UID is bound to auth.uid.
+      // - Initial status must strictly be 'waiting'.
+      allow create: if isAuthenticated() &&
+        isValidVisit(request.resource.data) &&
+        request.resource.data.status == 'waiting';
+
+      // 3. Update:
+      // - Patients CANNOT update visits (prevents tampering with clinical intake).
+      // - Only approved doctors can update the status field.
+      // - FIELD-DIFF VALIDATION: Ensures ONLY 'status' can change.
+      //   All intake data, ownership, and timestamps are strictly immutable.
+      allow update: if isApprovedDoctor() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+        request.resource.data.status in ['waiting', 'in-consultation', 'completed'];
+
+      // 4. Delete: Denied from client
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // Default Deny Rule for all other paths
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
